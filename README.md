@@ -26,8 +26,9 @@
    引用缺失、UID 缺失等），并提供**匿名化 ZIP 下载**（扁平文件名，不保留原始
    目录结构，避免路径泄露 PHI）。
 
-> ⚠️ 请妥善保管稳定密钥。服务不存储密钥，只在响应中返回其 SHA-256 指纹前 12 位
-> 以便核对批次；密钥一旦丢失，无法将新旧伪名/UID 对应回原值。
+> ⚠️ 请妥善保管稳定密钥。服务不存储密钥（任务清单同样只保存指纹），只在响应中
+> 返回其 SHA-256 指纹前 12 位以便核对批次；密钥一旦丢失，无法将新旧伪名/UID
+> 对应回原值。
 
 ---
 
@@ -66,6 +67,37 @@ docker compose down
 ```bash
 pip install -r requirements.txt
 uvicorn app.main:app --host 0.0.0.0 --port 8000
+```
+
+### 任务持久化与重启恢复
+
+任务处理完成后，服务会把**任务元数据、逐文件预览与诊断、结果索引**
+（患者/检查/系列/SOP 映射）以及**匿名输出文件索引**（文件名/大小/SHA-256）
+写入任务目录下的版本化清单 `<工作目录>/<任务ID>/manifest.json`
+（先写同目录临时文件再原子替换，崩溃不会留下半份清单）。清单只保存密钥
+指纹，**绝不保存稳定密钥**。
+
+服务重启（容器重启/重建后挂载同一数据卷）时自动扫描工作卷：
+
+- **恢复**：未过期、清单完整且匿名输出与索引一致（文件集合、大小、
+  SHA-256 全部相符）的任务，按**原任务 ID** 恢复——`GET /jobs/{id}`、
+  全部子资源（检查子集/合并下载/DICOMDIR/PNG 预览/几何/KVP/剂量事件/
+  SEG 覆盖率）与 ZIP 下载直接可用，**无需重新上传或重新匿名化**；
+- **清理**：已过期、清单缺失/损坏/版本不符、输出与索引不一致的目录
+  （包括处理中断留下的半成品目录）一律删除；中断下载遗留的临时文件
+  一并清理。
+
+到期判定与运行中的定期清理使用**同一到期时间**
+（`created_at + DICOM_ANON_JOB_TTL_SECONDS`，随清单持久化，重启不漂移）。
+
+Compose 默认把工作目录放在命名卷 `dicom-anon-data`（容器内
+`/data/dicom-anon`）上：`docker compose down` **不会**删除该卷，重启后
+任务仍可恢复；`docker compose down -v` 会连同数据卷一起删除（全部任务
+随之销毁）。改为绑定挂载宿主机目录亦可：
+
+```yaml
+    volumes:
+      - /srv/dicom-anon:/data/dicom-anon
 ```
 
 ---
@@ -1421,7 +1453,8 @@ else:
 | `DICOMDIR_SKIPPED` | info | DICOMDIR 不写入匿名包（其路径会泄露 PHI） |
 
 出错文件不会进入匿名 ZIP；`X-Job-Error-Count` 响应头给出错误文件数。任务结果
-默认保留 1 小时（可配置），到期自动清理磁盘。
+默认保留 1 小时（可配置），到期自动清理磁盘；保留期内服务重启可从工作卷按原
+任务 ID 恢复（见[任务持久化与重启恢复](#任务持久化与重启恢复)）。
 
 ---
 
@@ -1503,11 +1536,11 @@ UID 是否缺失——“标签存在但为空/空白”与“标签完全缺失
 | 变量 | 默认值 | 说明 |
 | --- | --- | --- |
 | `DICOM_ANON_PORT`（仅 Compose） | `8000` | 宿主机映射端口 |
-| `DICOM_ANON_WORK_DIR` | `/data/dicom-anon` | 任务工作目录 |
+| `DICOM_ANON_WORK_DIR` | `/data/dicom-anon` | 任务工作目录（含版本化清单，重启恢复的数据源） |
 | `DICOM_ANON_MAX_UPLOAD_BYTES` | `536870912`（512 MiB） | 上传 ZIP 上限 |
 | `DICOM_ANON_MAX_EXTRACTED_BYTES` | `2147483648`（2 GiB） | 解压总量上限 |
 | `DICOM_ANON_MAX_EXTRACTED_FILES` | `20000` | 解压文件数上限 |
-| `DICOM_ANON_JOB_TTL_SECONDS` | `3600` | 任务结果保留时长 |
+| `DICOM_ANON_JOB_TTL_SECONDS` | `3600` | 任务结果保留时长（运行中清理与重启恢复共用同一到期时间） |
 | `DICOM_ANON_MIN_SECRET_LENGTH` | `8` | 稳定密钥最小长度 |
 | `DICOM_ANON_CURSOR_TTL_SECONDS` | `900` | 一致性核对分页游标的有效期（秒） |
 
@@ -1532,10 +1565,11 @@ UID 是否缺失——“标签存在但为空/空白”与“标签完全缺失
 │   ├── pagination.py    # 差异明细不透明分页游标：HMAC 签名、绑定任务集合/level、TTL
 │   ├── crypto.py        # HMAC 确定性派生：伪名、UID、日期偏移
 │   ├── tags.py          # Annex E 标签策略与参与一致性重写的 UID 标签集合
-│   ├── jobs.py          # 任务存储、线程池处理、TTL 清理
+│   ├── jobs.py          # 任务存储、线程池处理、版本化清单持久化与启动恢复、TTL 清理
+│   ├── manifest.py      # 任务清单：原子写入（临时文件 + os.replace）、版本/结构校验、输出索引 SHA-256 核对
 │   ├── schemas.py       # 请求/响应模型（含一致性核对、分页、子集/合并/DICOMDIR/预览/几何/KVP/剂量事件/SEG 覆盖率错误模型）
 │   └── config.py        # 环境变量配置
-├── tests/               # pytest：加密派生 / 引擎 / API 端到端 / 一致性核对 / 分页游标 / 检查子集 / 跨任务合并 / DICOMDIR / PNG 预览 / 系列几何 / 系列 KVP 分布 / 剂量 SR 照射事件 / SEG 分割覆盖率 / ZIP 同名条目（308 个用例）
+├── tests/               # pytest：加密派生 / 引擎 / API 端到端 / 一致性核对 / 分页游标 / 检查子集 / 跨任务合并 / DICOMDIR / PNG 预览 / 系列几何 / 系列 KVP 分布 / 剂量 SR 照射事件 / SEG 分割覆盖率 / ZIP 同名条目 / 工作卷重启恢复（349 个用例）
 ├── Dockerfile
 ├── docker-compose.yml
 └── requirements.txt
