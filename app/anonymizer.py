@@ -55,6 +55,14 @@ class Diagnostic:
     def to_dict(self) -> dict:
         return {"code": self.code, "severity": self.severity, "message": self.message}
 
+    @classmethod
+    def from_dict(cls, data: dict) -> "Diagnostic":
+        return cls(
+            code=str(data["code"]),
+            severity=str(data["severity"]),
+            message=str(data["message"]),
+        )
+
 
 @dataclass
 class Change:
@@ -74,6 +82,17 @@ class Change:
             "old": self.old,
             "new": self.new,
         }
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "Change":
+        return cls(
+            tag=data.get("tag"),
+            keyword=str(data.get("keyword", "")),
+            action=str(data.get("action", "")),
+            old=data.get("old"),
+            new=data.get("new"),
+            path=str(data.get("path", "")),
+        )
 
 
 @dataclass
@@ -110,6 +129,25 @@ class FileReport:
             "changes_truncated": self.changes_truncated,
         }
 
+    @classmethod
+    def from_dict(cls, data: dict) -> "FileReport":
+        """从清单/序列化字典还原（忽略 to_dict 中派生的 max_severity 字段）。"""
+        return cls(
+            name=str(data["name"]),
+            status=str(data["status"]),
+            entry_index=int(data.get("entry_index", -1)),
+            output_name=data.get("output_name"),
+            sop_instance_uid=data.get("sop_instance_uid"),
+            study_instance_uid=data.get("study_instance_uid"),
+            series_instance_uid=data.get("series_instance_uid"),
+            patient_key=data.get("patient_key"),
+            diagnostics=[
+                Diagnostic.from_dict(d) for d in data.get("diagnostics", [])
+            ],
+            changes=[Change.from_dict(c) for c in data.get("changes", [])],
+            changes_truncated=bool(data.get("changes_truncated", False)),
+        )
+
 
 @dataclass
 class PatientInfo:
@@ -118,6 +156,25 @@ class PatientInfo:
     new_patient_name: str
     date_shift_days: int
     file_count: int = 0
+
+    def to_dict(self) -> dict:
+        return {
+            "key": self.key,
+            "new_patient_id": self.new_patient_id,
+            "new_patient_name": self.new_patient_name,
+            "date_shift_days": self.date_shift_days,
+            "file_count": self.file_count,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "PatientInfo":
+        return cls(
+            key=str(data["key"]),
+            new_patient_id=str(data["new_patient_id"]),
+            new_patient_name=str(data["new_patient_name"]),
+            date_shift_days=int(data["date_shift_days"]),
+            file_count=int(data.get("file_count", 0)),
+        )
 
 
 @dataclass
